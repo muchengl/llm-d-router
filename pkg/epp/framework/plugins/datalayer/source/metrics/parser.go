@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package metrics
 
 import (
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/prometheus/common/expfmt"
@@ -52,11 +53,25 @@ func (p *familyFilteringParser) parse(data io.Reader) (PrometheusMetricMap, erro
 		return parseMetrics(data)
 	}
 
+	// Keep the original scrape so an unfilterable payload can fall back to the
+	// exact bytes the endpoint sent.
+	raw, _ := bufferPool.Get().(*bytes.Buffer)
+	raw.Reset()
+	defer bufferPool.Put(raw)
+	if _, err := raw.ReadFrom(data); err != nil {
+		return nil, err
+	}
+
 	buf, _ := bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer bufferPool.Put(buf)
 
-	if err := filterFamilies(buf, data, want); err != nil {
+	if err := filterFamilies(buf, bytes.NewReader(raw.Bytes()), want); err != nil {
+		if errors.Is(err, errUnfilterable) {
+			// The scrape holds a line the scanner will not judge, so the
+			// parser reads it exactly as the endpoint sent it.
+			return parseMetrics(bytes.NewReader(raw.Bytes()))
+		}
 		return nil, err
 	}
 	return parseMetrics(buf)

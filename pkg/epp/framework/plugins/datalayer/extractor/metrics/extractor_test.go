@@ -266,6 +266,85 @@ func TestExtractorMultiEngine(t *testing.T) {
 	}
 }
 
+// TestExtractorMetricNames covers the declaration the metrics data source
+// filters a scrape against. The engine of an endpoint is unknown until
+// extraction, so the declaration must span every registered mapping: a family
+// omitted from it is a family the source is free to discard before this
+// extractor ever sees it.
+func TestExtractorMetricNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		register map[string]*Mapping
+		want     []string
+	}{
+		{
+			name: "spans every registered mapping",
+			register: map[string]*Mapping{
+				DefaultEngineType: mustMapping(t, "vllm:num_requests_waiting", "", "", "", ""),
+				"sglang":          mustMapping(t, "sglang:num_queue_reqs", "", "", "", ""),
+			},
+			want: []string{"vllm:num_requests_waiting", "sglang:num_queue_reqs"},
+		},
+		{
+			name: "declares a shared family once",
+			register: map[string]*Mapping{
+				DefaultEngineType: mustMapping(t, "shared:waiting", "vllm:num_requests_running", "", "", ""),
+				"sglang":          mustMapping(t, "shared:waiting", "sglang:num_running_reqs", "", "", ""),
+			},
+			want: []string{"shared:waiting", "vllm:num_requests_running", "sglang:num_running_reqs"},
+		},
+		{
+			name: "omits a metric the mapping leaves unset",
+			register: map[string]*Mapping{
+				DefaultEngineType: mustMapping(t, "vllm:num_requests_waiting", "", "", "", ""),
+			},
+			want: []string{"vllm:num_requests_waiting"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := NewMappingRegistry()
+			for engine, mapping := range tc.register {
+				if err := registry.Register(engine, mapping); err != nil {
+					t.Fatalf("failed to register %q: %v", engine, err)
+				}
+			}
+			extractor, err := NewCoreMetricsExtractor(registry, "")
+			if err != nil {
+				t.Fatalf("failed to create extractor: %v", err)
+			}
+
+			got := extractor.MetricNames()
+			if len(got) != len(tc.want) {
+				t.Fatalf("declared %d families %v, want %d %v", len(got), got, len(tc.want), tc.want)
+			}
+			declared := map[string]int{}
+			for _, name := range got {
+				declared[name]++
+			}
+			for _, name := range tc.want {
+				switch declared[name] {
+				case 1:
+				case 0:
+					t.Errorf("family %q is read but not declared", name)
+				default:
+					t.Errorf("family %q declared %d times, want once", name, declared[name])
+				}
+			}
+		})
+	}
+}
+
+func mustMapping(t *testing.T, queue, running, kvusage, lora, cacheInfo string) *Mapping {
+	t.Helper()
+	mapping, err := NewMapping(queue, running, kvusage, lora, cacheInfo)
+	if err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+	return mapping
+}
+
 func TestBackwardCompatibility(t *testing.T) {
 	ctx := context.Background()
 

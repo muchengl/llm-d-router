@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package metrics
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -94,10 +95,10 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 			expect:  "a_metric 1\na_metric{x=\"y\"} 3\n",
 		},
 		{
-			name:    "matches histogram series by name when headers are absent",
+			name:    "a series suffix names a family of its own when nothing declared the base",
 			payload: "h_bucket{le=\"1\"} 1\nh_sum 2\nother_sum 5\n",
 			want:    nameSet("h"),
-			expect:  "h_bucket{le=\"1\"} 1\nh_sum 2\n",
+			expect:  "",
 		},
 		{
 			name: "a free-form comment does not end the current family",
@@ -129,7 +130,7 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 			payload: "# HELP a help.\n# TYPE a gauge\na 1\n" +
 				"b 2\na_bucket 3\n",
 			want:   nameSet("a"),
-			expect: "# HELP a help.\n# TYPE a gauge\na 1\na_bucket 3\n",
+			expect: "# HELP a help.\n# TYPE a gauge\na 1\n",
 		},
 		{
 			name: "a bare sample after an unwanted family is judged on its own name",
@@ -144,6 +145,70 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 				"# HELP a_count help.\n# TYPE a_count gauge\na_count 2\n",
 			want:   nameSet("a_count"),
 			expect: "# HELP a_count help.\n# TYPE a_count gauge\na_count 2\n",
+		},
+		{
+			// Only histogram and summary name their samples after the family,
+			// so under any other type the suffixed name is a family of its own
+			// and the family in force does not speak for it.
+			name:    "a series suffix under a non-bucketing type is a family of its own",
+			payload: "# HELP a help.\n# TYPE a gauge\na 1\na_sum 2\n",
+			want:    nameSet("a_sum"),
+			expect:  "a_sum 2\n",
+		},
+		{
+			name:    "a series suffix without a type is a family of its own",
+			payload: "a 1\na_sum 2\n",
+			want:    nameSet("a_sum"),
+			expect:  "a_sum 2\n",
+		},
+		{
+			// The parser folds these into h, so no family named h_sum exists to
+			// keep, and keeping the line would invent one.
+			name:    "a series suffix of a histogram belongs to the histogram",
+			payload: "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+			want:    nameSet("h_sum"),
+			expect:  "",
+		},
+		{
+			// gaugehistogram folds the same suffixes histogram does.
+			name:    "a series suffix of a gaugehistogram belongs to the gaugehistogram",
+			payload: "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+			want:    nameSet("h"),
+			expect:  "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+		},
+		{
+			name:    "a gauge histogram spelled with an underscore also folds",
+			payload: "# TYPE h gauge_histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+			want:    nameSet("h"),
+			expect:  "# TYPE h gauge_histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+		},
+		{
+			// A summary claims _count and _sum but not _bucket, so s_bucket is
+			// a family of its own and s does not speak for it.
+			name:    "a summary does not claim the bucket suffix",
+			payload: "# TYPE s summary\ns{quantile=\"0.5\"} 1\ns_sum 2\ns_bucket 3\n",
+			want:    nameSet("s_bucket"),
+			expect:  "s_bucket 3\n",
+		},
+		{
+			// Attribution consults every family declared so far, not just the
+			// one immediately above, so h still claims h_sum after an
+			// intervening family.
+			name: "a series suffix is claimed by an earlier family across an intervening one",
+			payload: "# TYPE h histogram\nh_bucket{le=\"1\"} 1\n" +
+				"# TYPE other gauge\nother 5\n" +
+				"h_sum 2\n",
+			want:   nameSet("h"),
+			expect: "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+		},
+		{
+			// A family the payload already named shadows the folding, because
+			// the parser resolves an exact name before trying any suffix.
+			name: "an established family shadows the folding of its own name",
+			payload: "h_sum 1\n" +
+				"# TYPE h histogram\nh_bucket{le=\"1\"} 2\nh_sum 3\n",
+			want:   nameSet("h_sum"),
+			expect: "h_sum 1\nh_sum 3\n",
 		},
 		{
 			name:    "final line without a trailing newline is kept",
@@ -228,15 +293,85 @@ func TestFilteredParseMatchesFullParse(t *testing.T) {
 	}
 }
 
+// TestFilterFamiliesRefusesUnrecognizedLines pins the rule that bounds what the
+// scanner has to know: a line it cannot attribute to a family costs the whole
+// payload its filtering rather than being guessed at.
+func TestFilterFamiliesRefusesUnrecognizedLines(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			// The name is carried inside the braces, quoted, so it is not
+			// where a legacy name would be.
+			name:    "a sample whose name is quoted",
+			payload: "{\"a_metric\",le=\"1\"} 5\n",
+		},
+		{
+			// The family is whichever one an earlier line named, which a
+			// line-oriented reader cannot recover once it has dropped it.
+			name:    "a sample continuing the family in force",
+			payload: "a_metric{x=\"y\"} 1\n{x=\"z\"} 2\n",
+		},
+		{
+			name:    "a header naming a family it cannot spell",
+			payload: "# HELP \"a.metric\" help.\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := filterFamilies(&buf, strings.NewReader(tc.payload), nameSet("a_metric"))
+			if !errors.Is(err, errUnfilterable) {
+				t.Fatalf("got %v, want errUnfilterable", err)
+			}
+		})
+	}
+}
+
+// TestFilteringParserFallsBackOnUnrecognizedLines checks the consequence that
+// matters: a payload the scanner refuses is still parsed, and parsed to exactly
+// what it would have been without the filter.
+func TestFilteringParserFallsBackOnUnrecognizedLines(t *testing.T) {
+	payloads := []string{
+		"{\"a_metric\",le=\"1\"} 5\n",
+		"a_metric{x=\"y\"} 1\n{x=\"z\"} 2\n",
+		"# HELP a_metric help.\n# TYPE a_metric gauge\na_metric 1\n{\"b_metric\"} 2\n",
+	}
+	for _, payload := range payloads {
+		t.Run(payload, func(t *testing.T) {
+			full, err := parseMetrics(strings.NewReader(payload))
+			if err != nil {
+				t.Fatalf("full parse: %v", err)
+			}
+
+			parser := newFamilyFilteringParser()
+			parser.observeExtractor(namerStub{names: []string{"a_metric"}})
+			got, err := parser.parse(strings.NewReader(payload))
+			if err != nil {
+				t.Fatalf("filtering parse: %v", err)
+			}
+
+			if len(got) != len(full) {
+				t.Fatalf("got %d families, want the %d a full parse produces", len(got), len(full))
+			}
+			for name, expected := range full {
+				actual, ok := got[name]
+				if !ok {
+					t.Fatalf("fallback dropped %s", name)
+				}
+				if expected.String() != actual.String() {
+					t.Errorf("%s differs\n full: %s\n got: %s", name, expected, actual)
+				}
+			}
+		})
+	}
+}
+
 func TestFamilySelectorUnionsDeclarations(t *testing.T) {
 	var s familySelector
 	if s.wanted() != nil {
 		t.Fatal("a selector with no declarations must keep everything")
-	}
-
-	s.observe(plainStub{})
-	if s.wanted() != nil {
-		t.Fatal("a plugin that declares nothing must keep everything")
 	}
 
 	s.observe(namerStub{names: []string{"a", "b"}})
@@ -250,6 +385,32 @@ func TestFamilySelectorUnionsDeclarations(t *testing.T) {
 		if _, ok := got[name]; !ok {
 			t.Errorf("union is missing %q", name)
 		}
+	}
+}
+
+// TestFamilySelectorKeepsEverythingForUndeclaringExtractor pins what makes
+// FamilyNamer safe to adopt one extractor at a time: an extractor that does not
+// declare its families may read any of them, so binding one disables filtering
+// for the source regardless of what its siblings declared.
+func TestFamilySelectorKeepsEverythingForUndeclaringExtractor(t *testing.T) {
+	tests := []struct {
+		name  string
+		binds []fwkplugin.Plugin
+	}{
+		{"undeclaring extractor binds first", []fwkplugin.Plugin{plainStub{}, namerStub{names: []string{"a"}}}},
+		{"undeclaring extractor binds last", []fwkplugin.Plugin{namerStub{names: []string{"a"}}, plainStub{}}},
+		{"extractor declares an empty set", []fwkplugin.Plugin{namerStub{names: []string{"a"}}, namerStub{}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var s familySelector
+			for _, ext := range tc.binds {
+				s.observe(ext)
+			}
+			if got := s.wanted(); got != nil {
+				t.Fatalf("selector filters to %v, want everything kept", got)
+			}
+		})
 	}
 }
 
