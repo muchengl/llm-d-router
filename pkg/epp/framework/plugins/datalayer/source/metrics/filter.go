@@ -17,12 +17,18 @@ limitations under the License.
 package metrics
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"io"
+	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/textparse"
 
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
@@ -123,76 +129,154 @@ var bufferPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
 
-// lineReaderPool recycles the readers used to split a scrape into lines.
-var lineReaderPool = sync.Pool{
-	New: func() any { return bufio.NewReaderSize(nil, defaultReadBufferSize) },
-}
-
-// defaultReadBufferSize is the initial line-splitting buffer. Lines longer than
-// this are handled by accumulating fragments, so the value bounds memory rather
-// than the accepted line length.
-const defaultReadBufferSize = 16 << 10
-
-// errUnfilterable reports that the payload contains a line the scanner cannot
-// attribute to a family, so no filtered form of it can be trusted.
+// errUnfilterable reports that the payload holds a construct no filtered form
+// of it can be trusted to reproduce, so the caller parses the original bytes.
 var errUnfilterable = errors.New("metrics: payload contains an unrecognized line")
 
-// filterFamilies copies the text-exposition lines belonging to want from src
-// into dst.
+// filterFamilies writes the entries of src belonging to want into dst, in the
+// text exposition format.
 //
-// The scanner recognizes exactly one shape: a "# HELP"/"# TYPE" header or a
-// sample whose name is a legacy metric name. Meeting anything else, it gives up
-// on the whole payload with errUnfilterable rather than guess, and the caller
-// parses the original bytes.
+// Reading is delegated to Prometheus's own text parser, so the grammar is not
+// reimplemented here. Two things remain the filter's own work.
 //
-// That all-or-nothing rule is what keeps this from having to be a second
-// implementation of the exposition format. The format is context-sensitive in
-// places a line-oriented reader cannot see: a sample opening with '{' either
-// carries its own name, quoted, or continues the family named by an earlier
-// line, and telling those apart requires the grammar this scanner deliberately
-// does not have. Refusing the payload costs a parse this change would otherwise
-// have saved; guessing would cost a sample. The grammar it does know is the one
-// that is closed by definition, so a format that grows can only ever cost the
-// first.
+// The first is attribution. Prometheus's data model has no metric families, so
+// the parser reports a sample named x_sum as a series and says nothing about
+// whether it belongs to family x. Getting that wrong is not recoverable: a line
+// kept under the wrong family is a sample lost or a family invented. It is
+// answered by familyIndex, which reproduces expfmt's own rule. What the parser
+// does supply is the declared type the rule needs, which the filter would
+// otherwise have to read out of the TYPE lines itself.
 //
-// Which family a line belongs to is a separate question from which shapes are
-// legible, and it is the one the filter must answer exactly: a line kept under
-// the wrong family is a sample lost or a family invented. It is answered by
-// familyIndex, which reproduces the parser's own attribution rather than
-// approximating it.
-func filterFamilies(dst *bytes.Buffer, src io.Reader, want map[string]struct{}) error {
-	reader, _ := lineReaderPool.Get().(*bufio.Reader)
-	reader.Reset(src)
+// The second is writing. The parser reports a value as a float64, so a retained
+// entry is spelled again rather than copied. The spelling can differ from the
+// input where the value does not.
+//
+// A payload the parser rejects is refused whole with errUnfilterable rather
+// than partly filtered, and the caller parses the original bytes. That keeps a
+// disagreement between this parser and expfmt costing a parse rather than a
+// scrape.
+func filterFamilies(dst *bytes.Buffer, src []byte, want map[string]struct{}) error {
 	index, _ := indexPool.Get().(familyIndex)
 	defer func() {
-		reader.Reset(nil)
-		lineReaderPool.Put(reader)
 		clear(index)
 		indexPool.Put(index)
 	}()
 
+	parser := textparse.NewPromParser(src, labels.NewSymbolTable(), false)
+	var lset labels.Labels
 	for {
-		line, err := readLine(reader)
-		if len(line) > 0 {
-			keep, kerr := index.keepLine(line, want)
-			if kerr != nil {
-				return kerr
-			}
-			if keep {
-				dst.Write(line)
-			}
-		}
+		entry, err := parser.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+			return errUnfilterable
+		}
+
+		switch entry {
+		case textparse.EntryHelp:
+			name, help := parser.Help()
+			if !index.admit(name, foldNone, false, want) {
+				continue
+			}
+			dst.WriteString("# HELP ")
+			dst.Write(name)
+			dst.WriteByte(' ')
+			writeEscapedHelp(dst, help)
+			dst.WriteByte('\n')
+
+		case textparse.EntryType:
+			name, declared := parser.Type()
+			if !index.admit(name, foldKindOf(declared), true, want) {
+				continue
+			}
+			dst.WriteString("# TYPE ")
+			dst.Write(name)
+			dst.WriteByte(' ')
+			dst.WriteString(string(declared))
+			dst.WriteByte('\n')
+
+		case textparse.EntrySeries:
+			series, timestamp, value := parser.Series()
+			if !index.admit(seriesName(series, parser, &lset), foldNone, false, want) {
+				continue
+			}
+			dst.Write(series)
+			dst.WriteByte(' ')
+			writeValue(dst, value)
+			if timestamp != nil {
+				dst.WriteByte(' ')
+				dst.WriteString(strconv.FormatInt(*timestamp, 10))
+			}
+			dst.WriteByte('\n')
+
+		case textparse.EntryComment:
+			// A comment that is not a header belongs to no family, and
+			// expfmt discards it.
+
+		default:
+			// A native histogram or a unit has no spelling in the format
+			// expfmt reads, so no filtered form of the payload is faithful.
+			return errUnfilterable
 		}
 	}
 }
 
-// filterState carries the decision made for the family a header named, so the
-// samples that follow it are admitted without repeating the lookup.
+// seriesName returns the metric name of the current sample. The name heads the
+// series bytes unless it is quoted inside the label list, which is the only
+// spelling that needs the parser's own view of the labels.
+func seriesName(series []byte, parser textparse.Parser, lset *labels.Labels) []byte {
+	if len(series) > 0 && series[0] != '{' {
+		for i := range series {
+			switch series[i] {
+			case '{', ' ', '\t':
+				return series[:i]
+			}
+		}
+		return series
+	}
+	parser.Labels(lset)
+	return []byte(lset.Get(model.MetricNameLabel))
+}
+
+// foldKindOf maps a declared type to how it attributes a suffixed sample.
+func foldKindOf(declared model.MetricType) foldKind {
+	switch declared {
+	case model.MetricTypeSummary:
+		return foldSummary
+	case model.MetricTypeHistogram, model.MetricTypeGaugeHistogram:
+		return foldHistogram
+	}
+	return foldNone
+}
+
+// writeValue writes v as the format spells it, using the shortest form that
+// parses back to v.
+func writeValue(dst *bytes.Buffer, v float64) {
+	switch {
+	case math.IsNaN(v):
+		dst.WriteString("NaN")
+	case math.IsInf(v, 1):
+		dst.WriteString("+Inf")
+	case math.IsInf(v, -1):
+		dst.WriteString("-Inf")
+	default:
+		var scratch [32]byte
+		dst.Write(strconv.AppendFloat(scratch[:0], v, 'g', -1, 64))
+	}
+}
+
+// helpEscaper restores the escapes the parser resolved when it read the text.
+var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
+
+func writeEscapedHelp(dst *bytes.Buffer, help []byte) {
+	if !bytes.ContainsAny(help, "\\\n") {
+		dst.Write(help)
+		return
+	}
+	dst.WriteString(helpEscaper.Replace(string(help)))
+}
+
 // familyIndex records every family the payload has named so far and how each
 // one attributes suffixed samples. It is the filter's copy of the parser's
 // metricFamiliesByName, kept because which family a line belongs to is decided
@@ -204,34 +288,13 @@ var indexPool = sync.Pool{
 	New: func() any { return make(familyIndex, 64) },
 }
 
-// keepLine reports whether line survives filtering, recording what the line
-// declares. It returns errUnfilterable for a line it cannot attribute.
-func (idx familyIndex) keepLine(line []byte, want map[string]struct{}) (bool, error) {
-	trimmed := trimLeadingSpace(line)
-	if isBlank(trimmed) {
-		return false, nil
-	}
-
-	var name []byte
-	kind, declaresType := foldNone, false
-	if trimmed[0] == '#' {
-		header, headerKind, isType, ok := headerFamilyName(trimmed[1:])
-		if !ok {
-			// A free-form comment belongs to no family.
-			return false, nil
-		}
-		name, kind, declaresType = header, headerKind, isType
-	} else {
-		name = sampleFamilyName(trimmed)
-	}
-	if !legacyName(name) {
-		return false, errUnfilterable
-	}
-
+// admit resolves the family name belongs to, records what the entry declares,
+// and reports whether that family is wanted.
+func (idx familyIndex) admit(name []byte, kind foldKind, declaresType bool, want map[string]struct{}) bool {
 	family := idx.attribute(name)
 	idx.record(family, kind, declaresType && string(family) == string(name))
 	_, wanted := want[string(family)]
-	return wanted, nil
+	return wanted
 }
 
 // record notes that family has been seen, and its declared type when declares
@@ -290,120 +353,4 @@ func cutSeriesSuffix(name []byte, suffixes []string) ([]byte, bool) {
 		}
 	}
 	return nil, false
-}
-
-// legacyName reports whether b is a metric name written in the form the text
-// exposition format has always used, [a-zA-Z_:][a-zA-Z0-9_:]*.
-//
-// This is the one shape the scanner claims to recognize. Names the format has
-// since grown other spellings for do not match, and neither will spellings it
-// grows later, so they reach errUnfilterable rather than a guess.
-func legacyName(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	for i, c := range b {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c == ':':
-		case i > 0 && c >= '0' && c <= '9':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// isBlank reports whether a line carries no content.
-func isBlank(line []byte) bool {
-	for _, c := range line {
-		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
-			return false
-		}
-	}
-	return true
-}
-
-// headerFamilyName extracts the family name from a "# HELP name ..." or
-// "# TYPE name ..." line, with the leading '#' already removed. It reports
-// false for any other comment. isType distinguishes the two, and kind is the
-// declared type's folding behaviour, meaningful only when isType.
-func headerFamilyName(comment []byte) (name []byte, kind foldKind, isType, ok bool) {
-	rest := trimLeadingSpace(comment)
-	keyword := rest[:fieldEnd(rest)]
-	isType = bytes.Equal(keyword, []byte("TYPE"))
-	if !isType && !bytes.Equal(keyword, []byte("HELP")) {
-		return nil, foldNone, false, false
-	}
-	rest = trimLeadingSpace(rest[len(keyword):])
-	name = rest[:fieldEnd(rest)]
-	if len(name) == 0 {
-		return nil, foldNone, false, false
-	}
-	if !isType {
-		return name, foldNone, false, true
-	}
-	// The parser upper-cases the type before resolving it and accepts two
-	// spellings for a gauge histogram, so the comparison has to accept every
-	// spelling that reaches the folding types.
-	declared := trimLeadingSpace(rest[len(name):])
-	declared = declared[:fieldEnd(declared)]
-	switch {
-	case bytes.EqualFold(declared, []byte("summary")):
-		kind = foldSummary
-	case bytes.EqualFold(declared, []byte("histogram")),
-		bytes.EqualFold(declared, []byte("gaugehistogram")),
-		bytes.EqualFold(declared, []byte("gauge_histogram")):
-		kind = foldHistogram
-	}
-	return name, kind, true, true
-}
-
-// sampleFamilyName returns the metric name of a sample line, which ends at the
-// label list or at the whitespace before the value.
-func sampleFamilyName(line []byte) []byte {
-	for i := range line {
-		switch line[i] {
-		case '{', ' ', '\t', '\n', '\r':
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func trimLeadingSpace(b []byte) []byte {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
-		b = b[1:]
-	}
-	return b
-}
-
-// fieldEnd returns the index that ends the leading whitespace-delimited field.
-func fieldEnd(b []byte) int {
-	for i := range b {
-		switch b[i] {
-		case ' ', '\t', '\n', '\r':
-			return i
-		}
-	}
-	return len(b)
-}
-
-// readLine returns one line including its terminator. Lines longer than the
-// reader's buffer are reassembled, so no scrape is rejected for line length.
-// The returned slice is only valid until the next call.
-func readLine(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadSlice('\n')
-	if err != bufio.ErrBufferFull {
-		return line, err
-	}
-	// Rare path: the line exceeds the buffer, so copy it out and keep reading.
-	joined := make([]byte, len(line))
-	copy(joined, line)
-	for {
-		line, err = r.ReadSlice('\n')
-		joined = append(joined, line...)
-		if err != bufio.ErrBufferFull {
-			return joined, err
-		}
-	}
 }

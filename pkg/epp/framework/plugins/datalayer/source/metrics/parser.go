@@ -66,7 +66,7 @@ func (p *familyFilteringParser) parse(data io.Reader) (PrometheusMetricMap, erro
 	buf.Reset()
 	defer bufferPool.Put(buf)
 
-	if err := filterFamilies(buf, bytes.NewReader(raw.Bytes()), want); err != nil {
+	if err := filterFamilies(buf, raw.Bytes(), want); err != nil {
 		if errors.Is(err, errUnfilterable) {
 			// The scrape holds a line the scanner will not judge, so the
 			// parser reads it exactly as the endpoint sent it.

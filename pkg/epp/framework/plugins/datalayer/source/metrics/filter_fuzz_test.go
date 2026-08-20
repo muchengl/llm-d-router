@@ -41,10 +41,10 @@ var fuzzWantedNames = []string{"a", "h", "a_sum", "h_bucket", "vllm:num_requests
 // property this target checks. Keeping the two apart is what lets the target
 // say whether a crash came from the payload or from filtering it.
 func parseRecovered(parse func(io.Reader) (PrometheusMetricMap, error), payload string) (
-	fams PrometheusMetricMap, err error, fatal any) {
+	fams PrometheusMetricMap, fatal any, err error) {
 	defer func() { fatal = recover() }()
 	fams, err = parse(strings.NewReader(payload))
-	return fams, err, nil
+	return fams, nil, err
 }
 
 // FuzzFilterAgreesWithFullParse pins the only property the filter owes its
@@ -101,7 +101,7 @@ func FuzzFilterAgreesWithFullParse(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, payload string) {
-		full, err, fatal := parseRecovered(parseMetrics, payload)
+		full, fatal, err := parseRecovered(parseMetrics, payload)
 		if err != nil || fatal != nil {
 			// The filter owes nothing on a payload the parser rejects, and
 			// nothing on one it cannot survive.
@@ -110,7 +110,7 @@ func FuzzFilterAgreesWithFullParse(f *testing.F) {
 
 		parser := newFamilyFilteringParser()
 		parser.observeExtractor(namerStub{names: fuzzWantedNames})
-		filtered, err, fatal := parseRecovered(parser.parse, payload)
+		filtered, fatal, err := parseRecovered(parser.parse, payload)
 		if fatal != nil {
 			t.Fatalf("filtering produced a payload the parser cannot survive: %v\npayload: %q", fatal, payload)
 		}

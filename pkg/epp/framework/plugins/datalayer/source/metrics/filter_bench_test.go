@@ -45,12 +45,13 @@ func BenchmarkParseScrape(b *testing.B) {
 	})
 
 	b.Run("filtered", func(b *testing.B) {
+		src := []byte(payload)
 		var buf bytes.Buffer
 		b.ReportAllocs()
 		b.SetBytes(int64(len(payload)))
 		for b.Loop() {
 			buf.Reset()
-			if err := filterFamilies(&buf, strings.NewReader(payload), want); err != nil {
+			if err := filterFamilies(&buf, src, want); err != nil {
 				b.Fatal(err)
 			}
 			families, err := parseMetrics(&buf)
@@ -68,13 +69,14 @@ func BenchmarkParseScrape(b *testing.B) {
 func BenchmarkFilterFamilies(b *testing.B) {
 	payload := vllmScrapeFixture()
 	want := nameSet(vllmConsumedFamilies...)
+	src := []byte(payload)
 	var buf bytes.Buffer
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
 	for b.Loop() {
 		buf.Reset()
-		if err := filterFamilies(&buf, strings.NewReader(payload), want); err != nil {
+		if err := filterFamilies(&buf, src, want); err != nil {
 			b.Fatal(err)
 		}
 	}

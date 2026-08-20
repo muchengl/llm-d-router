@@ -59,7 +59,7 @@ func nameSet(names ...string) map[string]struct{} {
 func filterToString(t *testing.T, payload string, want map[string]struct{}) string {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := filterFamilies(&buf, strings.NewReader(payload), want); err != nil {
+	if err := filterFamilies(&buf, []byte(payload), want); err != nil {
 		t.Fatalf("filterFamilies: %v", err)
 	}
 	return buf.String()
@@ -170,19 +170,6 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 			expect:  "",
 		},
 		{
-			// gaugehistogram folds the same suffixes histogram does.
-			name:    "a series suffix of a gaugehistogram belongs to the gaugehistogram",
-			payload: "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
-			want:    nameSet("h"),
-			expect:  "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
-		},
-		{
-			name:    "a gauge histogram spelled with an underscore also folds",
-			payload: "# TYPE h gauge_histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
-			want:    nameSet("h"),
-			expect:  "# TYPE h gauge_histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
-		},
-		{
 			// A summary claims _count and _sum but not _bucket, so s_bucket is
 			// a family of its own and s does not speak for it.
 			name:    "a summary does not claim the bucket suffix",
@@ -211,10 +198,32 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 			expect: "h_sum 1\nh_sum 3\n",
 		},
 		{
-			name:    "final line without a trailing newline is kept",
+			// The entry is written again rather than copied, so the final
+			// newline the format requires is supplied.
+			name:    "final line without a trailing newline is terminated",
 			payload: "a_metric 1",
 			want:    nameSet("a_metric"),
-			expect:  "a_metric 1",
+			expect:  "a_metric 1\n",
+		},
+		{
+			// The name is carried inside the braces, quoted, which the parser
+			// resolves the same way it resolves a name written in front.
+			name:    "a sample whose name is quoted is attributed to that name",
+			payload: "{\"a_metric\",le=\"1\"} 5\n",
+			want:    nameSet("a_metric"),
+			expect:  "{\"a_metric\",le=\"1\"} 5\n",
+		},
+		{
+			name:    "a header naming a family in quotes is attributed to it",
+			payload: "# HELP \"a.metric\" help.\n",
+			want:    nameSet("a.metric"),
+			expect:  "# HELP a.metric help.\n",
+		},
+		{
+			name:    "a quoted name that is not wanted is dropped",
+			payload: "# HELP a_metric help.\n# TYPE a_metric gauge\na_metric 1\n{\"b_metric\"} 2\n",
+			want:    nameSet("a_metric"),
+			expect:  "# HELP a_metric help.\n# TYPE a_metric gauge\na_metric 1\n",
 		},
 		{
 			name:    "empty want set drops everything",
@@ -242,7 +251,7 @@ func TestFilterFamiliesKeepsOnlyWantedFamilies(t *testing.T) {
 // TestFilterFamiliesHandlesLinesLongerThanReadBuffer covers the reassembly path:
 // a LoRA info metric can carry hundreds of adapter names on a single line.
 func TestFilterFamiliesHandlesLinesLongerThanReadBuffer(t *testing.T) {
-	adapters := strings.Repeat("adapter-with-a-long-name,", (defaultReadBufferSize/25)+64)
+	adapters := strings.Repeat("adapter-with-a-long-name,", ((16<<10)/25)+64)
 	long := fmt.Sprintf("lora{running_lora_adapters=%q} 1\n", adapters)
 	payload := "dropped 0\n" + long + "also_dropped 0\n"
 
@@ -266,7 +275,7 @@ func TestFilteredParseMatchesFullParse(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := filterFamilies(&buf, strings.NewReader(payload), want); err != nil {
+	if err := filterFamilies(&buf, []byte(payload), want); err != nil {
 		t.Fatalf("filterFamilies: %v", err)
 	}
 	filteredParser := expfmt.NewTextParser(model.LegacyValidation)
@@ -296,32 +305,40 @@ func TestFilteredParseMatchesFullParse(t *testing.T) {
 // TestFilterFamiliesRefusesUnrecognizedLines pins the rule that bounds what the
 // scanner has to know: a line it cannot attribute to a family costs the whole
 // payload its filtering rather than being guessed at.
-func TestFilterFamiliesRefusesUnrecognizedLines(t *testing.T) {
+// TestFilterFamiliesRefusesWhatTheParserRejects pins the payloads the filter
+// declines whole. Each is a spelling expfmt reads and model/textparse does not,
+// so refusing costs a parse rather than a sample.
+func TestFilterFamiliesRefusesWhatTheParserRejects(t *testing.T) {
 	tests := []struct {
 		name    string
 		payload string
 	}{
 		{
-			// The name is carried inside the braces, quoted, so it is not
-			// where a legacy name would be.
-			name:    "a sample whose name is quoted",
-			payload: "{\"a_metric\",le=\"1\"} 5\n",
-		},
-		{
-			// The family is whichever one an earlier line named, which a
-			// line-oriented reader cannot recover once it has dropped it.
+			// The family is whichever one an earlier line named, which the
+			// parser does not carry across entries.
 			name:    "a sample continuing the family in force",
 			payload: "a_metric{x=\"y\"} 1\n{x=\"z\"} 2\n",
 		},
 		{
-			name:    "a header naming a family it cannot spell",
-			payload: "# HELP \"a.metric\" help.\n",
+			// The text format the parser reads declares five types, and the
+			// gauge histogram is not among them.
+			name:    "a gaugehistogram type",
+			payload: "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+		},
+		{
+			name:    "a gauge histogram spelled with an underscore",
+			payload: "# TYPE h gauge_histogram\nh_bucket{le=\"1\"} 1\nh_sum 2\n",
+		},
+		{
+			// The type is matched literally rather than folded to lower case.
+			name:    "a type declared in upper case",
+			payload: "# TYPE h SUMMARY\nh_sum 2\n",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			err := filterFamilies(&buf, strings.NewReader(tc.payload), nameSet("a_metric"))
+			err := filterFamilies(&buf, []byte(tc.payload), nameSet("a_metric", "h"))
 			if !errors.Is(err, errUnfilterable) {
 				t.Fatalf("got %v, want errUnfilterable", err)
 			}
@@ -330,13 +347,13 @@ func TestFilterFamiliesRefusesUnrecognizedLines(t *testing.T) {
 }
 
 // TestFilteringParserFallsBackOnUnrecognizedLines checks the consequence that
-// matters: a payload the scanner refuses is still parsed, and parsed to exactly
+// matters: a payload the filter refuses is still parsed, and parsed to exactly
 // what it would have been without the filter.
 func TestFilteringParserFallsBackOnUnrecognizedLines(t *testing.T) {
 	payloads := []string{
-		"{\"a_metric\",le=\"1\"} 5\n",
 		"a_metric{x=\"y\"} 1\n{x=\"z\"} 2\n",
-		"# HELP a_metric help.\n# TYPE a_metric gauge\na_metric 1\n{\"b_metric\"} 2\n",
+		"# TYPE a_metric gaugehistogram\na_metric_sum 2\n",
+		"# TYPE a_metric SUMMARY\na_metric_sum 2\n",
 	}
 	for _, payload := range payloads {
 		t.Run(payload, func(t *testing.T) {
